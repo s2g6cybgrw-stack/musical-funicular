@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pintura Sonora</title>
+<style>
+  :root { --bg: #0d0f1a; --fg: #e8e8f0; --muted: #8a8fa8; --panel: rgba(20,22,38,.85); }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  canvas { display: block; touch-action: none; cursor: crosshair; }
+  .bar { position: fixed; left: 16px; right: 16px; bottom: 16px; display: flex; gap: 8px;
+    flex-wrap: wrap; align-items: center; justify-content: center; padding: 10px 12px;
+    background: var(--panel); border-radius: 14px; backdrop-filter: blur(8px); }
+  button, select { font: inherit; font-size: 14px; color: var(--fg); background: #22253a;
+    border: 1px solid #33374f; border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  button:hover, select:hover { background: #2c3050; }
+  button.on { background: #5b4bd6; border-color: #7a6cf0; }
+  .hint { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none;
+    text-align: center; color: var(--muted); transition: opacity .6s; }
+  .hint h1 { color: var(--fg); font-weight: 600; margin: 0 0 8px; font-size: clamp(24px, 5vw, 40px); }
+  .hint p { margin: 4px 16px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hint" id="hint">
+  <div>
+    <h1>Pintura Sonora</h1>
+    <p>Arrastra para pintar música. Más arriba, más agudo.</p>
+    <p>Teclas: <b>espacio</b> reproducir · <b>C</b> borrar · <b>1–4</b> escala</p>
+  </div>
+</div>
+<div class="bar">
+  <select id="scale" title="Escala">
+    <option value="penta">Pentatónica</option>
+    <option value="minor">Menor</option>
+    <option value="dorian">Dórica</option>
+    <option value="japan">Japonesa</option>
+  </select>
+  <select id="wave" title="Timbre">
+    <option value="triangle">Suave</option>
+    <option value="sine">Puro</option>
+    <option value="sawtooth">Brillante</option>
+    <option value="square">8-bit</option>
+  </select>
+  <button id="play">▶ Reproducir</button>
+  <button id="loop">Bucle</button>
+  <button id="clear">Borrar</button>
+</div>
+<script>
+const SCALES = {
+  penta:  [0, 2, 4, 7, 9],
+  minor:  [0, 2, 3, 5, 7, 8, 10],
+  dorian: [0, 2, 3, 5, 7, 9, 10],
+  japan:  [0, 1, 5, 7, 8],
+};
+const OCTAVES = 3, BASE_MIDI = 48; // C3
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const $ = id => document.getElementById(id);
+let W, H, dpr;
+let strokes = [];          // [{hue, pts:[{x,y,t}]}]  x,y normalised 0..1
+let current = null, lastNote = null, lastNoteTime = 0;
+let particles = [];
+let playing = false, looping = false, playStart = 0, playDur = 0;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  cv.style.width = W + 'px'; cv.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener('resize', resize); resize();
+
+// ---------- Audio ----------
+let ac, master, delay;
+function audio() {
+  if (ac) return ac;
+  ac = new (window.AudioContext || window.webkitAudioContext)();
+  master = ac.createGain(); master.gain.value = 0.35;
+  delay = ac.createDelay(); delay.delayTime.value = 0.28;
+  const fb = ac.createGain(); fb.gain.value = 0.35;
+  const wet = ac.createGain(); wet.gain.value = 0.3;
+  delay.connect(fb).connect(delay);
+  delay.connect(wet).connect(ac.destination);
+  master.connect(ac.destination); master.connect(delay);
+  return ac;
+}
+
+function degreeFromY(y) {
+  const scale = SCALES[$('scale').value];
+  const steps = scale.length * OCTAVES;
+  const i = Math.min(steps - 1, Math.floor((1 - y) * steps));
+  return i;
+}
+function midiFromDegree(i) {
+  const scale = SCALES[$('scale').value];
+  return BASE_MIDI + 12 * Math.floor(i / scale.length) + scale[i % scale.length];
+}
+
+function playNote(x, y, when = 0) {
+  const a = audio();
+  const midi = midiFromDegree(degreeFromY(y));
+  const t = a.currentTime + when;
+  const osc = a.createOscillator(), g = a.createGain(), pan = a.createStereoPanner();
+  osc.type = $('wave').value;
+  osc.frequency.value = 440 * Math.pow(2, (midi - 69) / 12);
+  pan.pan.value = x * 2 - 1;
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(0.5, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.9);
+  osc.connect(g).connect(pan).connect(master);
+  osc.start(t); osc.stop(t + 1);
+}
+
+// ---------- Drawing ----------
+function hueFor(y) { return (1 - y) * 280; }
+
+function sparkle(px, py, hue) {
+  for (let i = 0; i < 10; i++) {
+    const a = Math.random() * Math.PI * 2, s = 1 + Math.random() * 3;
+    particles.push({ x: px, y: py, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 1, hue });
+  }
+}
+
+function trigger(x, y) {
+  playNote(x, y);
+  sparkle(x * W, y * H, hueFor(y));
+}
+
+const clamp01 = v => Math.min(1, Math.max(0, v));
+// Pointer capture keeps reporting moves outside the canvas, so clamp.
+function pointer(e) { return { x: clamp01(e.clientX / W), y: clamp01(e.clientY / H) }; }
+
+cv.addEventListener('pointerdown', e => {
+  audio(); if (ac.state === 'suspended') ac.resume();
+  $('hint').style.opacity = 0;
+  cv.setPointerCapture(e.pointerId);
+  const p = pointer(e);
+  current = { pts: [{ ...p, t: performance.now() }] };
+  strokes.push(current);
+  lastNote = degreeFromY(p.y); lastNoteTime = performance.now();
+  trigger(p.x, p.y);
+});
+cv.addEventListener('pointermove', e => {
+  if (!current) return;
+  const p = pointer(e), now = performance.now();
+  current.pts.push({ ...p, t: now });
+  const d = degreeFromY(p.y);
+  // New note when pitch changes, or every 180ms while holding a pitch
+  if (d !== lastNote || now - lastNoteTime > 180) {
+    lastNote = d; lastNoteTime = now;
+    trigger(p.x, p.y);
+  }
+});
+const end = () => { current = null; };
+cv.addEventListener('pointerup', end);
+cv.addEventListener('pointercancel', end);
+
+function drawStroke(s, highlightUpTo = -1) {
+  const pts = s.pts;
+  if (pts.length < 2) {
+    const p = pts[0];
+    ctx.fillStyle = `hsl(${hueFor(p.y)} 90% 65%)`;
+    ctx.beginPath(); ctx.arc(p.x * W, p.y * H, 4, 0, 7); ctx.fill();
+    return;
+  }
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i];
+    const lit = i <= highlightUpTo;
+    ctx.strokeStyle = `hsl(${hueFor(b.y)} 90% ${lit ? 75 : 60}%)`;
+    ctx.lineWidth = lit ? 7 : 4;
+    ctx.beginPath(); ctx.moveTo(a.x * W, a.y * H); ctx.lineTo(b.x * W, b.y * H); ctx.stroke();
+  }
+}
+
+function drawGrid() {
+  const steps = SCALES[$('scale').value].length * OCTAVES;
+  for (let i = 0; i < steps; i++) {
+    const y = H - (i / steps) * H;
+    const root = i % SCALES[$('scale').value].length === 0;
+    ctx.fillStyle = root ? 'rgba(255,255,255,.06)' : 'rgba(255,255,255,.025)';
+    ctx.fillRect(0, y - 1, W, root ? 2 : 1);
+  }
+}
+
+// ---------- Playback ----------
+// Replays the strokes left-to-right: a vertical playhead sweeps the canvas
+// and every stroke point it crosses plays its note.
+let playX = 0, prevPlayX = 0, playedKeys = new Set();
+function startPlay() {
+  if (!strokes.length) return;
+  audio(); if (ac.state === 'suspended') ac.resume();
+  playing = true; playStart = performance.now(); playDur = 4000;
+  prevPlayX = -0.001; playedKeys.clear();
+  $('play').textContent = '■ Parar'; $('play').classList.add('on');
+}
+function stopPlay() {
+  playing = false;
+  $('play').textContent = '▶ Reproducir'; $('play').classList.remove('on');
+}
+
+function tickPlayback() {
+  if (!playing) return;
+  playX = (performance.now() - playStart) / playDur;
+  if (playX >= 1) {
+    if (looping) { playStart = performance.now(); playX = 0; prevPlayX = -0.001; playedKeys.clear(); }
+    else { stopPlay(); return; }
+  }
+  strokes.forEach((s, si) => {
+    let lastDeg = null;
+    s.pts.forEach((p, pi) => {
+      if (p.x > prevPlayX && p.x <= playX) {
+        const d = degreeFromY(p.y), key = si + ':' + d + ':' + Math.floor(p.x * 32);
+        if (d !== lastDeg && !playedKeys.has(key)) {
+          playedKeys.add(key); trigger(p.x, p.y);
+        }
+        lastDeg = d;
+      }
+    });
+  });
+  prevPlayX = playX;
+  ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(playX * W, 0); ctx.lineTo(playX * W, H); ctx.stroke();
+}
+
+// ---------- Loop ----------
+function frame() {
+  ctx.fillStyle = '#0d0f1a'; ctx.fillRect(0, 0, W, H);
+  drawGrid();
+  ctx.lineCap = 'round'; ctx.shadowBlur = 14;
+  strokes.forEach(s => {
+    ctx.shadowColor = `hsl(${hueFor(s.pts[0].y)} 90% 60%)`;
+    const upTo = playing ? s.pts.filter(p => p.x <= playX).length - 1 : -1;
+    drawStroke(s, upTo);
+  });
+  ctx.shadowBlur = 0;
+  particles = particles.filter(p => (p.life -= 0.025) > 0);
+  particles.forEach(p => {
+    p.x += p.vx; p.y += p.vy; p.vy += 0.05;
+    ctx.fillStyle = `hsla(${p.hue} 100% 70% / ${p.life})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 2.5 * p.life + .5, 0, 7); ctx.fill();
+  });
+  tickPlayback();
+  requestAnimationFrame(frame);
+}
+frame();
+
+// ---------- Controls ----------
+$('play').onclick = () => playing ? stopPlay() : startPlay();
+$('loop').onclick = () => { looping = !looping; $('loop').classList.toggle('on', looping); };
+$('clear').onclick = () => { strokes = []; stopPlay(); };
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  if (e.code === 'Space') { e.preventDefault(); playing ? stopPlay() : startPlay(); }
+  if (e.key === 'c' || e.key === 'C') $('clear').click();
+  const n = '1234'.indexOf(e.key);
+  if (n >= 0) $('scale').selectedIndex = n;
+});
+</script>
+</body>
+</html>
